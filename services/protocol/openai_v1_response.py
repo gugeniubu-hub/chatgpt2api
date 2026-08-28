@@ -28,7 +28,12 @@ from services.protocol.web_search_tool import (
     search_query_from_messages,
     text_with_url_citations,
 )
-from utils.helper import extract_image_from_message_content, extract_response_prompt, has_response_image_generation_tool
+from utils.helper import (
+    extract_image_from_message_content,
+    extract_response_prompt,
+    has_response_image_generation_tool,
+    route_image_model_for_size,
+)
 from utils.image_tokens import (
     count_image_content_tokens,
     count_image_output_items_tokens,
@@ -435,15 +440,16 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         images = None
     input_image_tokens = count_image_content_tokens(_input_image_parts(body.get("input")), model)
     tool = response_image_tool(body)
+    routed_model, routed_size = route_image_model_for_size(model, tool.get("size"))
     image_outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
-        model=model,
-        size=tool.get("size"),
+        model=routed_model,
+        size=routed_size,
         quality=str(tool.get("quality") or "auto"),
         response_format="b64_json",
         images=images,
     ))
-    yield from stream_image_response(image_outputs, prompt, model, input_image_tokens, tool.get("size"), str(tool.get("quality") or "auto"))
+    yield from stream_image_response(image_outputs, prompt, model, input_image_tokens, routed_size, str(tool.get("quality") or "auto"))
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:

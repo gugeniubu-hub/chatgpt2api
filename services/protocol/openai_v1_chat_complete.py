@@ -29,7 +29,14 @@ from services.protocol.web_search_tool import (
     search_query_from_messages,
     text_with_url_citations,
 )
-from utils.helper import build_chat_image_markdown_content, extract_chat_image, extract_chat_prompt, is_image_chat_request, parse_image_count
+from utils.helper import (
+    build_chat_image_markdown_content,
+    extract_chat_image,
+    extract_chat_prompt,
+    is_image_chat_request,
+    parse_image_count,
+    route_image_model_for_size,
+)
 from utils.image_tokens import (
     chat_usage_from_image_usage,
     count_image_inputs_tokens,
@@ -231,10 +238,14 @@ def image_result_content(result: dict[str, Any]) -> str:
 
 def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
     model, prompt, n, images = chat_image_args(body)
+    routed_model, size = route_image_model_for_size(model, body.get("size"))
+    quality = str(body.get("quality") or "auto")
     result = collect_image_outputs(stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
-        model=model,
+        model=routed_model,
         n=n,
+        size=size,
+        quality=quality,
         response_format="b64_json",
         images=encode_images(images) or None,
     )))
@@ -242,7 +253,7 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
     usage = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         input_image_tokens=count_image_inputs_tokens(images, model),
-        output_tokens=count_image_output_items_tokens(result.get("data")),
+        output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),
     )
     response["usage"] = chat_usage_from_image_usage(usage)
     return response
@@ -250,10 +261,13 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
 
 def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     model, prompt, n, images = chat_image_args(body)
+    routed_model, size = route_image_model_for_size(model, body.get("size"))
     image_outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
-        model=model,
+        model=routed_model,
         n=n,
+        size=size,
+        quality=str(body.get("quality") or "auto"),
         response_format="b64_json",
         images=encode_images(images) or None,
     ))

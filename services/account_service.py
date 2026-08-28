@@ -838,6 +838,7 @@ class AccountService:
             return [
                 token
                 for account in self._accounts.values()
+                if account.get("status") != "禁用"
                 if str(account.get("refresh_token") or "").strip()
                 and (token := str(account.get("access_token") or "").strip())
                 and self._token_needs_refresh(token)
@@ -958,6 +959,7 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            excluded_tokens: set[str] | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -965,7 +967,7 @@ class AccountService:
         限制最大尝试次数防止 token rotation 导致无限循环。
         """
         max_attempts = 20  # 防止无限循环
-        attempted_tokens: set[str] = set()
+        attempted_tokens: set[str] = set(excluded_tokens or set())
         for _attempt in range(max_attempts):
             access_token = self._acquire_next_candidate_token(
                 excluded_tokens=attempted_tokens,
@@ -1378,6 +1380,12 @@ class AccountService:
                     self.remove_invalid_token(active_token, event)
                 raise
         self._record_refresh_success(active_token)
+        # Manual 禁用 is a persistent operator decision.  Remote account
+        # metadata reports only upstream health/quota and must not revive a
+        # disabled account during the watcher refresh cycle.
+        current_account = self.get_account(active_token)
+        if current_account and current_account.get("status") == "禁用":
+            result = {**result, "status": "禁用", "quota": 0}
         return self.update_account(active_token, result)
 
     # ---- 刷新进度追踪 ----

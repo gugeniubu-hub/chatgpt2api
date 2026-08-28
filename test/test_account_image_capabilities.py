@@ -96,6 +96,24 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(plus_token, "token-plus")
             self.assertEqual(pro_token, "token-pro")
 
+    def test_get_available_access_token_skips_request_limited_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([
+                {"access_token": "token-limited", "type": "Plus", "source_type": "codex", "status": "正常", "quota": 3},
+                {"access_token": "token-ready", "type": "Plus", "source_type": "codex", "status": "正常", "quota": 3},
+            ])
+            service.fetch_remote_info = lambda access_token, event="fetch_remote_info": service.get_account(access_token)
+
+            token = service.get_available_access_token(
+                source_type="codex",
+                plan_types=("plus", "team", "pro"),
+                excluded_tokens={"token-limited"},
+            )
+            service.release_image_slot(token)
+
+            self.assertEqual(token, "token-ready")
+
     def test_refresh_accounts_can_remove_invalid_token_without_confirmation_delay(self) -> None:
         original_value = config.data.get("auto_remove_invalid_accounts")
         config.data["auto_remove_invalid_accounts"] = True

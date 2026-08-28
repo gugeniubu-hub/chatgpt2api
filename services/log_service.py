@@ -183,11 +183,12 @@ def _image_error_response(exc: Exception) -> JSONResponse:
     from services.protocol.conversation import public_image_error_message
 
     message = public_image_error_message(str(exc))
-    if "no available image quota" in message.lower():
+    normalized_message = message.lower()
+    if "no available" in normalized_message and "image quota" in normalized_message:
         return openai_error_response(
             {
                 "error": {
-                    "message": "no available image quota",
+                    "message": message,
                     "type": "insufficient_quota",
                     "param": None,
                     "code": "insufficient_quota",

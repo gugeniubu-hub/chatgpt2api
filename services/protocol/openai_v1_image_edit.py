@@ -14,6 +14,7 @@ from services.protocol.conversation import (
     stream_image_chunks,
     stream_image_outputs_with_pool,
 )
+from utils.helper import route_image_model_for_size
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
 
 
@@ -53,9 +54,9 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     images = body.get("images") or []
     masks = body.get("mask") or []
     images = _composite_mask(images, masks)
-    model = str(body.get("model") or "gpt-image-2")
+    requested_model = str(body.get("model") or "gpt-image-2")
     n = int(body.get("n") or 1)
-    size = body.get("size")
+    model, size = route_image_model_for_size(requested_model, body.get("size"))
     quality = str(body.get("quality") or "auto")
     response_format = str(body.get("response_format") or "b64_json")
     base_url = str(body.get("base_url") or "") or None
@@ -79,8 +80,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         return stream_image_chunks(outputs)
     result = collect_image_outputs(outputs)
     result["usage"] = image_usage(
-        input_text_tokens=count_text_tokens(prompt, model),
-        input_image_tokens=count_image_inputs_tokens(images, model),
+        input_text_tokens=count_text_tokens(prompt, requested_model),
+        input_image_tokens=count_image_inputs_tokens(images, requested_model),
         output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),
     )
     return result

@@ -7,9 +7,11 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from io import BytesIO
 from typing import Any, Iterable, Iterator
 
 import tiktoken
+from PIL import Image, ImageFilter, ImageOps
 
 from services.account_service import account_service
 from services.config import config
@@ -17,6 +19,7 @@ from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
+    UpstreamHTTPError,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -277,16 +280,22 @@ def format_image_result(
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         if response_format == "b64_json":
-            data.append({
+            result_item = {
                 "b64_json": b64_json,
                 "url": save_image_bytes(base64.b64decode(b64_json), base_url),
                 "revised_prompt": revised_prompt,
-            })
+            }
+            if item.get("output_format"):
+                result_item["output_format"] = str(item["output_format"])
+            data.append(result_item)
         else:
-            data.append({
+            result_item = {
                 "url": save_image_bytes(base64.b64decode(b64_json), base_url),
                 "revised_prompt": revised_prompt,
-            })
+            }
+            if item.get("output_format"):
+                result_item["output_format"] = str(item["output_format"])
+            data.append(result_item)
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if message and not data:
         result["message"] = message
@@ -1260,6 +1269,92 @@ def _codex_response_images(value: Any) -> list[str]:
     return []
 
 
+_EXACT_IMAGE_SIZE_RE = re.compile(r"^(\d{1,5})x(\d{1,5})$", re.IGNORECASE)
+_MAX_CODEX_CROP_AREA_LOSS = 0.08
+
+
+def _codex_resize_to_target(source: Image.Image, target_size: tuple[int, int]) -> tuple[Image.Image, str]:
+    source_width, source_height = source.size
+    target_width, target_height = target_size
+    source_ratio = source_width / source_height
+    target_ratio = target_width / target_height
+    retained_area_ratio = min(source_ratio, target_ratio) / max(source_ratio, target_ratio)
+    crop_area_loss = 1.0 - retained_area_ratio
+
+    if crop_area_loss <= _MAX_CODEX_CROP_AREA_LOSS:
+        return (
+            ImageOps.fit(source, target_size, method=Image.Resampling.LANCZOS),
+            "center_crop",
+        )
+
+    # Large aspect-ratio changes would crop away important people, text, or
+    # products. Extend a blurred canvas and keep the full generated image in
+    # the foreground instead.
+    background = ImageOps.fit(
+        source.convert("RGB"),
+        target_size,
+        method=Image.Resampling.LANCZOS,
+    ).filter(ImageFilter.GaussianBlur(radius=max(target_size) / 80))
+    foreground = ImageOps.contain(source, target_size, method=Image.Resampling.LANCZOS)
+    offset = (
+        (target_width - foreground.width) // 2,
+        (target_height - foreground.height) // 2,
+    )
+    if "A" in foreground.getbands():
+        background.paste(foreground, offset, foreground.getchannel("A"))
+    else:
+        background.paste(foreground, offset)
+    return background, "blurred_canvas"
+
+
+def normalize_codex_image_size(image_base64: str, requested_size: str | None) -> str:
+    """Return a Codex image at the exact downstream-requested dimensions.
+
+    The Codex image tool may return a nearby canvas size even when an exact
+    size is sent. OpenAI-compatible downstreams commonly validate the decoded
+    dimensions, so normalize the final pixels before exposing the response.
+    ``ImageOps.fit`` preserves aspect ratio and center-crops only the overflow.
+    """
+    match = _EXACT_IMAGE_SIZE_RE.fullmatch(str(requested_size or "").strip())
+    if not match:
+        return image_base64
+    target_size = (int(match.group(1)), int(match.group(2)))
+    if (
+        min(target_size) <= 0
+        or max(target_size) > 8192
+        or target_size[0] * target_size[1] > 40_000_000
+    ):
+        return image_base64
+
+    try:
+        raw = base64.b64decode(image_base64, validate=True)
+        with Image.open(BytesIO(raw)) as source:
+            source.load()
+            original_size = source.size
+            orientation = int(source.getexif().get(274, 1) or 1)
+            oriented = ImageOps.exif_transpose(source)
+            if oriented.size == target_size and orientation == 1:
+                return image_base64
+            if oriented.size == target_size:
+                normalized, resize_strategy = oriented.copy(), "exif_transpose"
+            else:
+                normalized, resize_strategy = _codex_resize_to_target(oriented, target_size)
+            if normalized.mode not in {"RGB", "RGBA", "L", "LA", "P"}:
+                normalized = normalized.convert("RGB")
+            output = BytesIO()
+            normalized.save(output, format="PNG")
+    except Exception as exc:
+        raise ImageGenerationError("Codex returned an invalid image result") from exc
+
+    logger.info({
+        "event": "codex_image_size_normalized",
+        "original_size": f"{original_size[0]}x{original_size[1]}",
+        "requested_size": f"{target_size[0]}x{target_size[1]}",
+        "strategy": resize_strategy,
+    })
+    return base64.b64encode(output.getvalue()).decode("ascii")
+
+
 def stream_codex_image_outputs(
         backend: OpenAIBackendAPI,
         request: ConversationRequest,
@@ -1275,7 +1370,14 @@ def stream_codex_image_outputs(
     if not images:
         raise ImageGenerationError("No image result found in response")
     data = format_image_result(
-        [{"b64_json": item, "revised_prompt": request.prompt} for item in images],
+        [
+            {
+                "b64_json": normalize_codex_image_size(item, request.size),
+                "revised_prompt": request.prompt,
+                "output_format": "png",
+            }
+            for item in images
+        ],
         request.prompt,
         request.response_format,
         request.base_url,
@@ -1305,11 +1407,15 @@ def _generate_single_image(
     MAX_CONN_TIMEOUT_RETRIES = 3
     # 轮询超时错误最大重试次数（换账号重试）
     MAX_POLL_TIMEOUT_RETRIES = 4
+    # 上游账号额度耗尽时，跳过当前账号并轮换池中其他账号
+    MAX_RATE_LIMIT_RETRIES = 20
 
     text_reply_retry_count = 0
     tls_retry_count = 0
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
+    rate_limit_retry_count = 0
+    rate_limited_tokens: set[str] = set()
     account_email = ""
 
     while True:
@@ -1322,6 +1428,7 @@ def _generate_single_image(
                 plan_type=plan_type,
                 source_type="codex" if codex_model else None,
                 plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+                excluded_tokens=rate_limited_tokens,
             )
         except RuntimeError as exc:
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
@@ -1483,6 +1590,18 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
+            if not emitted_for_token and isinstance(exc, UpstreamHTTPError) and exc.status_code == 429:
+                rate_limited_tokens.add(token)
+                rate_limit_retry_count += 1
+                if rate_limit_retry_count <= MAX_RATE_LIMIT_RETRIES:
+                    logger.warning({
+                        "event": "image_stream_rate_limit_rotate",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "retry_count": rate_limit_retry_count,
+                        "index": index,
+                    })
+                    continue
             if not emitted_for_token and is_token_invalid_error(last_error):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:

@@ -131,6 +131,35 @@ def is_codex_image_model(model: object) -> bool:
     return base_model == CODEX_IMAGE_MODEL
 
 
+_IMAGE_SIZE_RE = re.compile(r"^(?P<width>\d+)\s*[x×]\s*(?P<height>\d+)$", re.IGNORECASE)
+_IMAGE_SIZE_ALIASES = {
+    "1k": "1024x1024",
+    "2k": "2048x2048",
+    "4k": "3840x2160",
+}
+
+
+def route_image_model_for_size(model: object, size: object) -> tuple[str, str | None]:
+    """Route high-resolution gpt-image-2 requests through the Codex image backend.
+
+    Downstream clients commonly send either an exact ``WIDTHxHEIGHT`` value or
+    a short ``2k``/``4k`` alias.  The regular image backend is kept for 1K
+    requests; any dimension of 2048 pixels or more uses the structured Codex
+    image endpoint, which can honor 2K/4K sizes.
+    """
+    requested_model = str(model or "gpt-image-2").strip() or "gpt-image-2"
+    raw_size = str(size or "").strip().lower().replace(" ", "")
+    normalized_size = _IMAGE_SIZE_ALIASES.get(raw_size, raw_size) or None
+    match = _IMAGE_SIZE_RE.fullmatch(normalized_size or "")
+    high_resolution = bool(
+        raw_size in {"2k", "4k"}
+        or (match and max(int(match.group("width")), int(match.group("height"))) >= 2048)
+    )
+    if requested_model.lower() == "gpt-image-2" and high_resolution:
+        return CODEX_IMAGE_MODEL, normalized_size
+    return requested_model, normalized_size
+
+
 def is_image_chat_request(body: dict[str, object]) -> bool:
     model = str(body.get("model") or "").strip()
     modalities = body.get("modalities")
